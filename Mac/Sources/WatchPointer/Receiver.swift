@@ -27,6 +27,12 @@ let quickness = setting("quick") ?? 0.01
 /// (the watch sends that time). Older watch builds don't, so then it's this long before the click arrived.
 let fallbackRewind = 0.1
 
+/// Double Tap moves the wrist while the fingers tap, so right after its click the aim has wandered from where the
+/// click landed. The pointer then stays put for `gestureHold` seconds and eases back to the aim over `easeAfterHold`,
+/// rather than visibly sliding off the spot it just clicked.
+let gestureHold = 0.4
+let easeAfterHold = 0.25
+
 /// Packets from the watch: [kind, Int16 LE a, Int16 LE b].
 /// `.aim`: hundredths of a degree from "Center" (a = turned left, b = tipped up), then UInt16 LE: when the watch
 /// measured it, in ms on its own clock (wraps). Older watch builds send no time; arrival time is used then.
@@ -34,7 +40,13 @@ let fallbackRewind = 0.1
 /// `.info`: [kind, JSON] describing the watch (see WatchInfo), not the fixed 5 bytes.
 /// `.drag`: a = 1 grab (mouse down), 0 drop (mouse up).
 /// Clicks and drags may add the same UInt16 ms time as `.aim`: when the thumb touched down (or lifted, for a drop).
-enum Kind: UInt8 { case aim = 0, leftClick = 1, rightClick = 2, scroll = 3, center = 4, pause = 5, info = 6, drag = 7 }
+/// A `.leftClick` with b = 1 comes from the Double Tap gesture: the pointer then holds still for a moment (see `click`).
+/// `.settings`: the watch's sliders. a = speed ×100, b = steadiness ×100 (1.0× = 100). Both scale the command-line values.
+///
+/// The Mac asks its owner before a watch may steer the cursor (see `access(for:firstPacket:)`). Until then every
+/// packet is ignored, and writes that expect an answer get an ATT error back: `.insufficientAuthorization` means
+/// "waiting for approval", `.writeNotPermitted` means "declined". The watch app shows both (see `Pointer.Access`).
+enum Kind: UInt8 { case aim = 0, leftClick = 1, rightClick = 2, scroll = 3, center = 4, pause = 5, info = 6, drag = 7, settings = 8 }
 
 /// 1€ filter (Casiez et al. 2012): heavy smoothing when the hand is nearly still (no jitter),
 /// almost none when it moves fast (no lag). The standard choice for pointing devices.
@@ -84,6 +96,14 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
     private var frameTimer: DispatchSourceTimer?
     private var history: [(time: Double, point: CGPoint)] = [] // where the cursor was, last ~1 s
     private var dragging = false
+    private var reach = reachDegrees  // degrees from the middle to the edge of the screen; the watch's Speed slider scales it
+    private var holdUntil = 0.0       // until then the pointer stays put (just after a Double Tap click)
+    private var scrolledThisSecond = 0 // pixels the watch asked to scroll in the current second, for the log
+
+    // Who may steer the cursor (only touched on `queue`). Kept in memory only: ask again after every launch.
+    private var allowed = Set<UUID>()   // devices the person approved in this run
+    private var declined = Set<UUID>()  // refused; asked again only after that device disconnects
+    private var asking = false          // one question at a time, so a stranger can't pile up dialogs
 
     init(live: Live) {
         self.live = live
@@ -128,6 +148,9 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
 
     /// The watch's Bluetooth link closed (app quit, out of range, watch asleep long enough to drop it).
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
+        declined.remove(central.identifier) // reconnecting is how a refused watch asks again
+        // Someone who was never allowed leaving must not reset the session of the watch that is.
+        guard allowed.contains(central.identifier) else { return }
         drop()
         watchInfo = nil
         ui { $0.watch = nil } // don't keep showing an old battery level or model
@@ -138,15 +161,60 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
-        if !askedForLowLatency, let watch = requests.first?.central {
-            askedForLowLatency = true
-            // Ask for the shortest Bluetooth interval, so samples arrive as often as possible.
-            peripheral.setDesiredConnectionLatency(.low, for: watch)
+        // A batch comes from one device, so the first request decides for all of them.
+        guard let first = requests.first else { return }
+        let result = access(for: first.central, firstPacket: first.value)
+        if result == .success {
+            if !askedForLowLatency {
+                askedForLowLatency = true
+                // Ask for the shortest Bluetooth interval, so samples arrive as often as possible.
+                peripheral.setDesiredConnectionLatency(.low, for: first.central)
+            }
+            for request in requests {
+                if let data = request.value { handle(data) }
+            }
         }
-        for request in requests {
-            if let data = request.value { handle(data) }
+        peripheral.respond(to: first, withResult: result)
+    }
+
+    // MARK: Consent
+
+    /// Whether this device may steer the cursor. Anyone nearby can connect and write to the input characteristic,
+    /// so nothing from a device the person hasn't approved ever reaches `handle`. The first packet from a new
+    /// device opens the question; the answer to the write itself never waits for it.
+    private func access(for central: CBCentral, firstPacket: Data?) -> CBATTError.Code {
+        let id = central.identifier
+        if allowed.contains(id) { return .success }
+        if declined.contains(id) { return .writeNotPermitted }
+        if !asking {
+            asking = true
+            // Decoded only to say who is asking. It is not stored, and it is not trusted.
+            var info: WatchInfo?
+            if let packet = firstPacket.map({ Data($0) }), packet.first == Kind.info.rawValue {
+                info = try? JSONDecoder().decode(WatchInfo.self, from: packet.dropFirst())
+            }
+            askForConsent(id: id, info: info)
         }
-        if let first = requests.first { peripheral.respond(to: first, withResult: .success) }
+        return .insufficientAuthorization
+    }
+
+    private func askForConsent(id: UUID, info: WatchInfo?) {
+        log("a device (…\(id.uuidString.suffix(8))) wants to control the cursor; waiting for approval")
+        // The receiver lives as long as the app, so holding `self` strongly here is fine.
+        DispatchQueue.main.async {
+            let approved = ConsentPrompt.ask(watch: info, id: id)
+            self.queue.async {
+                self.asking = false
+                if approved {
+                    self.allowed.insert(id)
+                    self.log("allowed (…\(id.uuidString.suffix(8)))")
+                } else {
+                    self.declined.insert(id)
+                    self.log("declined (…\(id.uuidString.suffix(8)))")
+                    self.ui { $0.show(.denied) }
+                }
+            }
+        }
     }
 
     private func handle(_ data: Data) {
@@ -166,7 +234,7 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
         case .aim:
             let ms = d.count >= 7 ? UInt16(d[5]) | UInt16(d[6]) << 8 : nil
             aim(left: Double(a) / 100, up: Double(b) / 100, watchMs: ms)
-        case .leftClick: log("click"); ui { $0.clicks += 1 }; click(.left, at: when(d))
+        case .leftClick: log(b != 0 ? "click (Double Tap)" : "click"); ui { $0.clicks += 1 }; click(.left, at: when(d), holdAfter: b != 0)
         case .rightClick: log("right click"); ui { $0.clicks += 1 }; click(.right, at: when(d))
         case .center: log("centered"); ui { $0.show(.centered) }
         case .drag: a != 0 ? grab(at: when(d)) : drop(at: when(d))
@@ -176,7 +244,9 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
             log(paused ? "paused" : "resumed")
             setPhase(paused ? .paused : .live, toast: paused ? .paused : .resumed)
         case .info: break // handled above
+        case .settings: apply(speed: Double(a) / 100, steady: Double(b) / 100)
         case .scroll:
+            scrolledThisSecond += abs(Int(a))
             CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: Int32(a), wheel2: 0, wheel3: 0)?
                 .post(tap: .cghidEventTap)
         }
@@ -184,12 +254,24 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
 
     // MARK: Aim → cursor
 
+    /// The watch's Speed and Steady settings, as multipliers on the command-line values (1 = unchanged).
+    /// Steadier = a lower cutoff, and a beta lowered by the square: beta is what opens the filter for fast movement,
+    /// and a trembling hand is fast movement too, so dividing it only by `steady` left most of the tremor through.
+    /// The price is slower following.
+    private func apply(speed: Double, steady: Double) {
+        let speed = min(max(speed, 0.25), 4), steady = min(max(steady, 0.25), 8)
+        reach = reachDegrees / speed
+        filterX.minCutoff = steadyCutoff / steady; filterX.beta = quickness / (steady * steady)
+        filterY.minCutoff = steadyCutoff / steady; filterY.beta = quickness / (steady * steady)
+        log(String(format: "settings: speed %.2f×, steady %.2f×", speed, steady))
+    }
+
     /// Projects the aim onto the screen the way a laser pointer hits a flat wall.
     private func aim(left: Double, up: Double, watchMs: UInt16?) {
         let screen = CGDisplayBounds(CGMainDisplayID())
         let h = min(max(-left, -80), 80) * .pi / 180
         let v = min(max(up, -80), 80) * .pi / 180
-        let pixelsPerUnit = screen.width / 2 / tan(reachDegrees * .pi / 180)
+        let pixelsPerUnit = screen.width / 2 / tan(reach * .pi / 180)
         let x = screen.midX + tan(h) * pixelsPerUnit
         let y = screen.midY - tan(v) / cos(h) * pixelsPerUnit
 
@@ -245,6 +327,10 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
             samplesThisSecond = 0
             let rate = rate
             ui { $0.rate = rate }
+            if scrolledThisSecond != 0 { // how far the Mac was told to scroll: the number to quote if it feels wrong
+                log("scrolled \(scrolledThisSecond) px in the last second")
+                scrolledThisSecond = 0
+            }
         }
         guard let target else { return }
         guard now - lastSample < 0.3 else { // watch idle: leave the trackpad alone
@@ -255,7 +341,10 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
             }
             return
         }
-        let next = CGPoint(x: shown.x + (target.x - shown.x) * follow, y: shown.y + (target.y - shown.y) * follow)
+        if now < holdUntil { return } // just clicked by Double Tap: stay where the click landed
+        // Right after that hold, ease back to the aim (~60 ms) instead of snapping to wherever the wrist ended up.
+        let step = now < holdUntil + easeAfterHold ? 1 - exp(-(1.0 / 240) / 0.06) : follow
+        let next = CGPoint(x: shown.x + (target.x - shown.x) * step, y: shown.y + (target.y - shown.y) * step)
         guard abs(next.x - shown.x) + abs(next.y - shown.y) > 0.05 else { return }
         shown = next
         // Every display is reachable, laid out as in System Settings › Displays. Pointing past the outer
@@ -308,13 +397,14 @@ final class Receiver: NSObject, CBPeripheralManagerDelegate {
         CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: button)?.post(tap: .cghidEventTap)
     }
 
-    private func click(_ button: CGMouseButton, at time: Double?) {
+    private func click(_ button: CGMouseButton, at time: Double?, holdAfter: Bool = false) {
         let p = pressPoint(at: time)
         post(dragging ? .leftMouseDragged : .mouseMoved, p)
         let (down, up): (CGEventType, CGEventType) = button == .left ? (.leftMouseDown, .leftMouseUp)
                                                                      : (.rightMouseDown, .rightMouseUp)
         post(down, p, button)
         post(up, p, button)
+        if holdAfter { holdUntil = ProcessInfo.processInfo.systemUptime + gestureHold }
     }
 
     /// Mouse down where the pointer was when the thumb pressed; following aim then drags.

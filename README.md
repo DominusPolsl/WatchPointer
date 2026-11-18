@@ -12,8 +12,10 @@ No Wi-Fi, no servers: the watch talks straight to the Mac over Bluetooth.
 
 ## What it does
 
-- **Point** like a laser pointer: the cursor goes where the top edge of the watch points. Works across all your displays.
+- **Point** like a laser pointer: the cursor goes where the pointing edge of the watch points: the Digital Crown side (3 o'clock) at first. The edge button next to Pause switches it, each tap going 12 → 3 → 6 → 9 o'clock. Works across all your displays.
 - **Tap** the pad to click, **hold** to drag, **right-click** button, **Digital Crown** to scroll.
+- **Double Tap** (tap your index finger and thumb together twice) clicks too, without touching the watch. Needs an Apple Watch with Double Tap (Series 9, Ultra 2 or newer), turned on in the watch's **Settings › Gestures**. The pointer holds still for a moment after that click, because the gesture itself moves your wrist.
+- **Speed**, **Steady** and **Scroll** settings on the watch (button at the top left, − and + for each): Speed is how far you have to turn to cross the screen, Steady ignores more of a shaking hand but follows a little slower, and Scroll is how fast the Digital Crown scrolls.
 - **Center** re-aims the middle of the screen; **Pause** frees the cursor for your trackpad.
 - **Pair** with a Mac once; the watch only connects to that Mac until you unpair it.
 - **Notch panel** on the Mac: connection state, the watch's name and model, battery, live aim, and a pin to keep it open.
@@ -44,10 +46,11 @@ It shows up in the notch (or the middle of the menu bar on Macs without one).
 2. In **Signing & Capabilities**, pick your team. If Xcode complains about the bundle identifier, change it to something of your own.
 3. Choose your Apple Watch as the run destination and press **⌘R**.
 4. Open WatchPointer on the watch and tap **Pair** next to your Mac.
+5. On the Mac, click **Allow** in the dialog that asks whether the watch may control your cursor.
 
 ### 3. Point
 
-Hold the watch like a remote with the top edge (12 o'clock) toward the screen. Point at the middle of the screen and tap **Center** to line it up.
+Point your arm at the screen so the pointing edge faces it. At first that is the edge with the Digital Crown (3 o'clock); on the left wrist it is the side toward your fingers. The edge button next to Pause changes it (12, 3, 6, 9 o'clock) and recentres. Aim at the middle of the screen and tap **Center** to line it up.
 
 ## Settings
 
@@ -58,6 +61,8 @@ swift run WatchPointer 1.2               # speed: higher = less turn to reach th
 swift run WatchPointer steady=0.6        # steadier when holding still (default 0.8)
 swift run WatchPointer quick=0.02        # less lag on fast moves (default 0.01)
 ```
+
+The Speed and Steady settings on the watch multiply `speed` and `steady`/`quick` above (1× = exactly what you started the receiver with), and are remembered on the watch. They reach the Mac as soon as you change them; the receiver prints a `settings:` line when they arrive. Restart the receiver after updating it: an older one ignores them.
 
 ## Sky Shot
 
@@ -75,7 +80,12 @@ On the iPhone's Watch app, turn off **Passcode › Wrist Detection**, or the wat
 
 ## Security note
 
-Pairing is chosen on the watch. The Mac itself doesn't ask for confirmation yet, so any nearby Bluetooth device that speaks this protocol could move the cursor while the receiver is running. Quit the receiver when you're not using it.
+Pairing is chosen on the watch, but the Mac decides who may move its cursor. The first time a device connects, the Mac shows **“Allow … to control your cursor?”**. Until you click **Allow**, nothing the device sends is acted on: no movement, clicks or scrolling. **Don't Allow** is the default button.
+
+- Your answer is kept only while the receiver is running. Quit and start it again, and it asks again.
+- The watch shows **Approve on your Mac** while it waits, and **Declined on your Mac** if you refuse. To ask again, unpair on the watch and pair again.
+- The name in the dialog is reported by the device itself, so check the device ID too. Only click Allow when you have just opened WatchPointer on your own watch.
+- This is a confirmation, not strong authentication: the app doesn't require an encrypted or authenticated Bluetooth link, and it recognises a device by the ID Bluetooth gives it. Quit the receiver when you're not using it.
 
 ## License
 

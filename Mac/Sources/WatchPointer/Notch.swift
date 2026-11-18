@@ -131,12 +131,13 @@ struct NotchView: View {
         case .centered: ("scope", "Centered")
         case .paused: ("pause.fill", "Paused")
         case .resumed: ("play.fill", "Resumed")
+        case .denied: ("hand.raised.fill", "Declined")
         case .lost, nil: ("applewatch.slash", "Disconnected")
         }
         HStack(spacing: 8) {
             Image(systemName: symbol)
                 .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(live.toast == .paused || live.toast == .lost ? .orange : .white)
+                .foregroundStyle(live.toast == .paused || live.toast == .lost || live.toast == .denied ? .orange : .white)
             Text(text)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.white)

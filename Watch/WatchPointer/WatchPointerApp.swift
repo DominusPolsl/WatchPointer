@@ -15,17 +15,30 @@ struct WatchPointerApp: App {
 }
 
 /// Packets: [kind, Int16 LE a, Int16 LE b].
-/// `.aim`: where the watch's 12 o'clock edge points, relative to "Center", in hundredths of a degree
+/// `.aim`: where the watch's pointing edge points (12, 3, 6 or 9 o'clock, picked on the watch; the Mac needn't know
+/// which), relative to "Center", in hundredths of a degree
 /// (a = turned left, b = tipped up), then UInt16 LE: when it was measured, in ms on the watch's clock (wraps).
 /// The Mac smooths with those times; Bluetooth delivers samples in bursts, so arrival times are useless.
 /// `.pause`: a = 1 paused, 0 resumed.
 /// `.info`: [kind, JSON] with the watch's model id, watchOS, battery and name (not the fixed 5 bytes).
 /// `.drag`: a = 1 grab (mouse down), 0 drop (mouse up).
 /// Clicks and drags may add the same UInt16 ms time as `.aim`: when the thumb touched down (or lifted, for a drop).
-enum Kind: UInt8 { case aim = 0, leftClick = 1, rightClick = 2, scroll = 3, center = 4, pause = 5, info = 6, drag = 7 }
+/// A `.leftClick` with b = 1 comes from the Double Tap gesture: the Mac then holds the pointer still for a moment.
+/// `.settings`: the Speed and Steady sliders. a = speed ×100, b = steadiness ×100 (1.0× = 100). They scale the values
+/// the Mac was started with.
+enum Kind: UInt8 { case aim = 0, leftClick = 1, rightClick = 2, scroll = 3, center = 4, pause = 5, info = 6, drag = 7, settings = 8 }
 
 /// How long you hold the screen before it grabs. The Mac uses the same number to undo the press's jolt.
 let holdToDrag = 0.35
+
+/// Mac scroll distance, in pixels, per unit of Crown turn, when Scroll is 1× in the settings. A turn of the Crown is a
+/// lot of these units, which is why this is small. (1× is 20 times slower than the 8 it was; Scroll 20× is that again.)
+private let crownPixels = 0.4
+
+/// The fastest the Mac ever scrolls, in pixels a second, when Scroll is 1× (it scales with Scroll). Without a ceiling,
+/// spinning the Crown scrolled as far as the units it produced, and no setting tamed that: one quick turn flew.
+/// (Also 20 times lower than before: it was 1000.)
+private let scrollCeiling = 50.0
 
 /// A Mac running the receiver, seen nearby.
 struct FoundMac: Identifiable {
@@ -34,9 +47,45 @@ struct FoundMac: Identifiable {
     let peripheral: CBPeripheral
 }
 
+/// What the Mac says about this watch. The Mac asks its owner before a new watch may move the cursor: until then
+/// writes that expect an answer fail with `.insufficientAuthorization` (waiting) or `.writeNotPermitted` (declined).
+enum Access { case unknown, allowed, waiting, declined }
+
+/// Which edge of the watch is the pointing end, named by where it sits on the clock face: 12 = the top, 3 = the Digital
+/// Crown side (on the left wrist it faces your fingers), 6 = the bottom, 9 = the side opposite the Crown.
+enum PointerEdge: Int {
+    case twelve = 12, three = 3, six = 6, nine = 9
+
+    var next: PointerEdge {
+        switch self {
+        case .twelve: .three
+        case .three: .six
+        case .six: .nine
+        case .nine: .twelve
+        }
+    }
+}
+
 final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     @Published var connected = false
+    @Published var access = Access.unknown
     @Published var paused = false
+    /// Speed (how little you turn to cross the screen) and steadiness (how much of a trembling hand is ignored).
+    /// 1.0 = as the Mac was started. Remembered, and sent to the Mac a moment after they stop changing.
+    @Published var speed = UserDefaults.standard.object(forKey: "speed") as? Double ?? 1 {
+        didSet { UserDefaults.standard.set(speed, forKey: "speed"); scheduleSettings() }
+    }
+    @Published var steady = UserDefaults.standard.object(forKey: "steady") as? Double ?? 1 {
+        didSet { UserDefaults.standard.set(steady, forKey: "steady"); scheduleSettings() }
+    }
+    /// Which edge you point with. Remembered.
+    @Published var edge = PointerEdge(rawValue: UserDefaults.standard.integer(forKey: "pointerEdge")) ?? .three {
+        didSet { UserDefaults.standard.set(edge.rawValue, forKey: "pointerEdge") }
+    }
+    /// How fast the Digital Crown scrolls (1.0 = the default). Remembered; only the watch needs it.
+    @Published var scrollSpeed = UserDefaults.standard.object(forKey: "scrollSpeed") as? Double ?? 1 {
+        didSet { UserDefaults.standard.set(scrollSpeed, forKey: "scrollSpeed") }
+    }
     /// Macs nearby you can pair with (only while nothing is paired).
     @Published var found: [FoundMac] = []
     /// The Mac you paired with. The watch only ever connects to this one until you forget it.
@@ -50,11 +99,16 @@ final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     private let motion = CMMotionManager()
 
     private var heading = 0.0       // radians turned left since "Center"
-    private var elevation = 0.0     // radians the top edge points above horizontal, right now
+    private var elevation = 0.0     // radians the pointing edge points above horizontal, right now
     private var elevationZero = 0.0 // elevation when "Center" was pressed
+    private var lastUp = (x: 0.0, y: 0.0, z: 1.0) // which way is up, in the watch's own axes, from the latest sample
     private var lastTimestamp: TimeInterval?
     private var infoTimer: Timer?
+    private var retryInfo: DispatchWorkItem? // asks the Mac again soon while it waits for its owner to approve
+    private var settingsWork: DispatchWorkItem? // sends the sliders once they stop moving
     private var pendingScroll = 0.0 // Crown turn not sent yet, in pixels
+    private var scrollBudget = 0.0  // pixels the ceiling still allows right now
+    private var lastScrollTime = ProcessInfo.processInfo.systemUptime
 
     override init() {
         super.init()
@@ -74,9 +128,41 @@ final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         send(.pause, paused ? 1 : 0)
     }
 
+    /// 12 → 3 → 6 → 9 → 12. The old aim means nothing for another edge, so this recentres too, like the Center button.
+    func cycleEdge() {
+        edge = edge.next
+        center()
+    }
+
     private func recenter() {
         heading = 0
+        elevation = elevationOf(lastUp) // for the current edge, not the sample before it was changed
         elevationZero = elevation
+    }
+
+    /// How far the pointing edge tips above horizontal, from the direction of gravity (`up`, in the watch's own axes:
+    /// x toward 3 o'clock, y toward 12). The opposite edge just flips the sign.
+    private func elevationOf(_ up: (x: Double, y: Double, z: Double)) -> Double {
+        let sine: Double = switch edge {
+        case .twelve: up.y
+        case .three: up.x
+        case .six: -up.y
+        case .nine: -up.x
+        }
+        return asin(min(max(sine, -1), 1))
+    }
+
+    /// The Mac applies these on arrival. It ignores them until its owner has approved this watch, so they are sent again
+    /// on connect and the moment that approval shows up (see `didWriteValueFor`).
+    private func scheduleSettings() {
+        settingsWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.sendSettings() }
+        settingsWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func sendSettings() {
+        send(.settings, Int16((speed * 100).rounded()), Int16((steady * 100).rounded()))
     }
 
     /// Tells the Mac which watch this is. Sent on connect, then every minute for the battery level.
@@ -112,8 +198,9 @@ final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
             let g = data.gravity, r = data.rotationRate
             let n = max((g.x * g.x + g.y * g.y + g.z * g.z).squareRoot(), 1e-6)
             let up = (x: -g.x / n, y: -g.y / n, z: -g.z / n)
-            // Up/down comes straight from gravity, so it never drifts.
-            elevation = asin(min(max(up.y, -1), 1))
+            // Up/down comes straight from gravity, so it never drifts: how far the pointing edge tips above horizontal.
+            lastUp = up
+            elevation = elevationOf(up)
             // Left/right has no absolute reference, so add up every turn around the vertical axis.
             // No dead zone: dropping slow turns is what made the old version slide out of line.
             heading += (r.x * up.x + r.y * up.y + r.z * up.z) * dt
@@ -140,8 +227,16 @@ final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     /// `at`: when it happened on the watch's clock (same clock as the motion samples). Clicks and drags send the
     /// moment the thumb touched down, so the Mac clicks where you were pointing then, before the tap jolted the watch.
     /// Each Crown event is a tiny fraction; keep the leftovers so slow turns still add up to scrolling.
-    func scroll(by pixels: Double) {
-        pendingScroll += pixels
+    /// `units`: Crown turn since the last call. Scrolls the Mac by that much times Scroll, but never faster than the
+    /// ceiling (also times Scroll): a bucket that refills at the ceiling and holds a tenth of a second of scrolling.
+    func scroll(crown units: Double) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let rate = scrollCeiling * scrollSpeed
+        scrollBudget = min(scrollBudget + (now - lastScrollTime) * rate, rate * 0.1)
+        lastScrollTime = now
+        let allowed = min(abs(units) * crownPixels * scrollSpeed, scrollBudget)
+        scrollBudget -= allowed
+        pendingScroll += units < 0 ? -allowed : allowed
         flushScroll()
     }
 
@@ -247,8 +342,36 @@ final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         connected = input != nil
         recenter()
         sendInfo()
+        sendSettings()
         infoTimer?.invalidate()
         infoTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.sendInfo() }
+    }
+
+    /// The answer to a write that expects one (info, clicks, drags, pause). Aim and scroll don't get one.
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == inputUUID else { return }
+        guard let error else {
+            if access != .allowed {
+                access = .allowed
+                sendSettings() // the Mac ignored them until it approved this watch
+            }
+            return
+        }
+        switch (error as? CBATTError)?.code {
+        case .insufficientAuthorization:
+            access = .waiting
+            // Ask again in a moment so the watch notices the approval right away, not at the next minute's info.
+            retryInfo?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                if self?.access == .waiting { self?.sendInfo() }
+            }
+            retryInfo = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+        case .writeNotPermitted:
+            access = .declined
+        default:
+            break
+        }
     }
 
     private func reset() {
@@ -256,8 +379,11 @@ final class Pointer: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         input = nil
         output = nil
         connected = false
+        access = .unknown
         paused = false
         pendingScroll = 0
+        retryInfo?.cancel()
+        settingsWork?.cancel()
         infoTimer?.invalidate()
         start()
     }
